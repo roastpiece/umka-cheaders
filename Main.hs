@@ -51,6 +51,7 @@ data Declaration
                , [(String, Maybe Int)] -- members (type, name)
                )
   | TypeDecl   ( TypedIdent )
+  | SkipDecl   ( String ) -- as hints
 
   deriving (Show, Eq)
 
@@ -70,6 +71,7 @@ data Token
   | RBrack
   | StructKeyword
   | EnumKeyword
+  | ExternKeyword
   | Comma
   | Skip
   | EqSign
@@ -104,6 +106,7 @@ tokens = [("int8_t",   Type $ IntType $ Signed Int8)
          ,("static",   Skip)
          ,("struct",   StructKeyword)
          ,("enum",     EnumKeyword)
+         ,("extern",   ExternKeyword)
          ,("unsigned", UnsignedKeyword)
          ,("typedef",  Typedef)
          ,(";",        Semicolon)
@@ -117,6 +120,17 @@ tokens = [("int8_t",   Type $ IntType $ Signed Int8)
          ,("=",        EqSign)
          ,("!",        Skip)
          ]
+
+data PreprocessTokens
+  = PP_ifndef
+  | PP_ifdef
+  | PP_if
+  | PP_else
+  | PP_elif
+  | PP_endif
+  | PP_include
+  | PP_define
+
 
 getIdent :: Token -> Either Error String
 getIdent (Ident ident) = Right ident
@@ -228,11 +242,11 @@ takeUntilN "" _ _ = ("", "")
 takeUntilN _ "" _ = ("", "")
 takeUntilN needle stack n
   | len > length stack = (stack, "")
-  | needle == front    = (take n stack, drop n stack)
+  | needle == front    = (take (n + len) stack, drop (n+len) stack)
   | otherwise          = takeUntilN needle stack (n+1)
   where
     len   = length needle
-    front = take len stack
+    front = take len $ drop n $ stack
 
 takeUntilAny :: String -> String -> (String, String)
 takeUntilAny chars stack = takeUntilAnyN chars stack 0
@@ -259,6 +273,7 @@ parser buffer =
 parseNextToken :: Token -> String -> Either Error (Declaration, String)
 parseNextToken (Type t)  b = parseFunctionDeclaration t b
 parseNextToken (Typedef) b = parseTypeDefinition b
+parseNextToken (ExternKeyword) b = Right $ (SkipDecl "extern", skipUntil "\n" b)
 parseNextToken nextTok   b = (markError b) $ Left $ "Unexpected token " ++ show nextTok
 
 parseFunctionDeclaration :: Type -> String -> Either Error (Declaration, String)
@@ -329,8 +344,6 @@ parseNumber buffer = do
     _            -> Left $ "IntLiteral expected but got " ++ (show nextTok)
 
 
-
-
 parseName :: String -> Either Error (String, String)
 parseName buffer = do
   (nextTok, afterName) <- getNextToken buffer
@@ -380,10 +393,21 @@ parseTypeDefinition :: String -> Either Error (Declaration, String)
 parseTypeDefinition buffer = do
   (nextToken, b) <- getNextToken buffer
   case nextToken of
-    StructKeyword -> parseStructDefinition b
-    EnumKeyword   -> parseEnumDefinition b
-    Ident name    -> parseTypeDeclaration buffer
-    tok -> Left $ "Unexpected typdef " ++ show tok
+    StructKeyword    -> parseStructDefinition b
+    EnumKeyword      -> parseEnumDefinition b
+
+    _ -> parseNewType buffer
+
+parseNewType :: String  -> Either Error (Declaration, String)
+parseNewType buffer = do
+  (nextType, afterType) <- parseType buffer
+  (tokAfterType, afterNextTok) <- getNextToken afterType
+  case tokAfterType of
+    Ident name -> parseTypeDeclaration buffer
+    LPar       -> skipDecl
+  where
+    (skipped, afterSkip) = takeUntilStr ";" buffer
+    skipDecl = Right (SkipDecl skipped, afterSkip)
 
 
 parseTypeDeclaration :: String -> Either Error (Declaration, String)
@@ -492,17 +516,18 @@ content :: String
 content = unsafePerformIO $ readFile "raylib.h"
 
 parseFile :: IO ()
-parseFile = putStrLn $ unlines $ map show $ parseRec [] content
+parseFile = putStrLn $ unlines $ map show $ parseRec content
 
-parseRec :: [Declaration] -> String -> [String]
-parseRec decs content =
-    let parsed = parser content
-    in case parsed of
-         Left err -> (map show decs) ++ [err]
-         Right (a, rest) ->
-           if length rest /= 0
-           then parseRec (decs ++ [a]) rest
-           else map show (decs ++ [a])
+parseRec :: String -> [String]
+parseRec content =
+    let decs = []
+        parsed = parser content
+        nextDecs =
+          case parsed of
+            Left err -> decs ++ [err]
+            Right (a, rest) ->
+              decs ++ [show a] ++ parseRec rest
+    in nextDecs
 
 
 main :: IO ()

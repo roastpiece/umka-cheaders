@@ -1,4 +1,4 @@
-module Main where
+module C where
 
 import Prelude hiding (takeWhile, error)
 import Data.List hiding (takeWhile)
@@ -17,7 +17,7 @@ newtype Parser a = Parser {
 }
 
 instance Functor Parser where
-  fmap f (Parser p) = Parser $ mapP
+  fmap f (Parser p) = Parser mapP
     where mapP buff = do
             (a, rest) <- p buff
             return (f a, rest)
@@ -25,7 +25,7 @@ instance Functor Parser where
 instance Applicative Parser where
   pure a = Parser (\buff -> Right (a, buff))
 
-  (Parser pfab) <*> (Parser pa) = Parser $ f
+  (Parser pfab) <*> (Parser pa) = Parser f
     where f buffer = do
             (fab, buff') <- pfab buffer
             (a, buff'') <- pa buff'
@@ -35,13 +35,13 @@ instance Alternative Parser where
   empty = Parser f
     where f _ = Left []
 
-  (Parser p1) <|> (Parser p2) = Parser $ f
+  (Parser p1) <|> (Parser p2) = Parser f
     where f buff = case p1 buff of
             Left _ -> p2 buff
             good   -> good
 
 instance Monad Parser where
-  (Parser p1) >>= faMb = Parser $ f
+  (Parser p1) >>= faMb = Parser f
     where f buff = do
             (first, rest) <- p1 buff
             case faMb first of
@@ -69,30 +69,39 @@ data Type
   | SChar
   | UChar
   | Void
-  | Ptr (Type)
+  | Ptr Type
+  | FnType Fn
   | Array (Type, Maybe Int)
-  | NamedType (String)
+  | NamedType String
   deriving (Show, Eq)
 
-data TypedIdent =
+newtype Fn = Fn ( String -- name
+             , Type -- return type
+             , [FnArg] -- args (type, name)
+             )
+  deriving (Show, Eq)
+
+data FnArg
+  = TypeArg TypedIdent
+  | VarArg
+  deriving (Show, Eq)
+
+newtype TypedIdent =
   TypedIdent (Type, String)
   deriving (Show, Eq)
 
-data IntLiteral = IntLiteral (Int)
+newtype IntLiteral = IntLiteral Int
 
 data Statement
-  = FunctionDecl ( String -- name
-                 , Type -- return type
-                 , [TypedIdent] -- args (type, name)
-                 )
+  = FunctionDecl Fn
   | StructDecl ( String -- name
                , [TypedIdent] -- members (type, name)
                )
   | EnumDecl   ( String -- name
                , [(String, Maybe Int)] -- members (type, name)
                )
-  | TypeDecl   ( TypedIdent )
-  | SkipDecl   ( String ) -- as hints
+  | TypeDecl   TypedIdent
+  | SkipDecl   String  -- as hints
 
   deriving (Show, Eq)
 
@@ -119,7 +128,7 @@ intSizeTokens = [("char",     Int8)
                ]
 
 spanParser :: (Char -> Bool) -> Parser String
-spanParser f = Parser $ pf
+spanParser f = Parser pf
   where pf buff = Right $ span f buff
 
 ps :: Parser String
@@ -132,11 +141,11 @@ parseWS = spanParser isWS
           | otherwise              = False
 
 parseAnyC :: String -> Parser String
-parseAnyC = sequenceA . map charParser
+parseAnyC = traverse charParser
 
 parseTokenMap :: [(String, a)] -> Parser a
 parseTokenMap = asum . m
-  where m = map (\(str,a) -> (\_ -> a) <$> parseString str)
+  where m = map (\(str,a) -> a <$ parseString str)
 
 parsePtr :: Parser Type -> Parser Type
 parsePtr mt = do
@@ -144,8 +153,7 @@ parsePtr mt = do
   ptrCs' <- ptrCs
   foldM foldPtr baseT ptrCs'
 
-  where ptrCs = many $ (charParser '*') <* ps
-        toPtr t = (\_ -> Ptr t)
+  where ptrCs = many $ charParser '*' <* ps
         foldPtr t _ = pure $ Ptr t
 
 parseArray :: Type -> Parser Type
@@ -163,12 +171,12 @@ parseUnsignedInt = unsigned *> ps *> (Unsigned <$> parseIntSize)
   where unsigned = parseString "unsigned"
 
 parseSignedInt :: Parser IntType
-parseSignedInt = (Signed <$> parseIntSize)
+parseSignedInt = Signed <$> parseIntSize
 
 parseInt :: Parser Type
 parseInt = toType <$> ints
   where ints = parseUnsignedInt <|> parseSignedInt
-        toType i = IntType i
+        toType = IntType
 
 parseFixedType :: Parser Type
 parseFixedType = parseTokenMap typeTokens
@@ -178,16 +186,15 @@ parseNamedType = NamedType <$> parseIdentM
 
 parseTypeN :: Parser Type
 parseTypeN = do
+  _ <- optional $ parseString "const" <* ps
   t <- parsePtr t
   arr <- optional $ parseArray t
-  return $ case arr of
-             Just arr' -> arr'
-             Nothing -> t
+  return $ fromMaybe t arr
   where types = parseFixedType <|> parseInt <|> parseNamedType
         t     = types <* ps
 
 concatStringM :: Parser String -> String -> Parser String
-concatStringM mb s = (\nextS -> concat [s, nextS]) <$> mb
+concatStringM mb s = (s ++) <$> mb
   
 parseIdentM :: Parser String
 parseIdentM = markErrorP "Error parsing identifier" $ firstC >>= concatStringM (parseRest <* ps)
@@ -211,7 +218,7 @@ parseTypedIdentM = do
 
 parseStatement :: Parser Statement
 parseStatement = markErrorP "Error parsing statement" $ statements <* ps
-  where statements = parseTypeDecl <|> parseStructDecl <|> parseEnumDecl
+  where statements = parseTypeDecl <|> parseStructDecl <|> parseEnumDecl <|> parseFnPtrDecl <|> parseFnDecl
         semic = charParser ';'
 
         parseTypeDecl = do
@@ -250,30 +257,71 @@ parseStatement = markErrorP "Error parsing statement" $ statements <* ps
                   _ <- optional $ charParser ',' <* ps
                   return (name, (\(IntLiteral int) -> int) <$> value)
 
+        parseFnArgs = do
+          args <- many arg
+          maybeVarArgs <- optional $ parseString "..." <* ps
+          varArgs <- case maybeVarArgs of
+                       Just _ -> pure [VarArg]
+                       Nothing -> pure []
+          return $ map TypeArg args ++ varArgs
+          where arg = do
+                  ti <- parseTypedIdentM <* ps
+                  _ <- optional $ charParser ',' <* ps
+                  return ti
+
+        -- typedef void (*TraceLogCallback)(int logLevel, const char *text, va_list args);
+        parseFnPtrDecl = do
+          _ <- parseString "typedef" <* ps
+          retType <- parseTypeN <* ps
+          _ <- charParser '(' <* ps
+          _ <- charParser '*' <* ps
+          name <- parseIdentM <* ps
+          _ <- charParser ')' <* ps
+          _ <- charParser '(' <* ps
+          args <- parseFnArgs
+          _ <- charParser ')' <* ps
+          _ <- semic <* ps
+          let fn = Ptr $ FnType $ Fn ( name, retType, args )
+              in return $ TypeDecl $ TypedIdent ( fn, name)
+
+        -- void InitWindow(int width, int height, const char *title);
+        -- FunctionDecl Fn
+        parseFnDecl = do
+          retType <- parseTypeN <* ps
+          name <- parseIdentM <* ps
+          _ <- charParser '(' <* ps
+          args <- parseFnArgs
+          _ <- if null args
+               then optional $ parseString "void" <* ps
+               else optional ps
+          _ <- charParser ')' <* ps
+          _ <- semic <* ps
+          return $ FunctionDecl $ Fn ( name, retType, args )
+
 
 parseIntLit :: Parser IntLiteral
 parseIntLit = (hex <|> bin <|> oct <|> dec) <* ps
   where dec = IntLiteral . read <$> spanParser isDigit
-        bin = (\[(num, _)] -> IntLiteral num) <$> readBin <$> ((parseString "0b") *> (some $ parseCharsAsum "01") <* ps)
-        hex = fmap (IntLiteral . read) $ (parseString "0x") >>= concatStringM ((some $ hexDigit) <* ps)
-        oct = fmap (IntLiteral . read) $ (parseString "0o") >>= concatStringM ((some $ octDigit) <* ps)
-        hexDigit = (parseCharF isDigit) <|> parseCharsAsum "abcdefABCDEF"
+        bin = (\[(num, _)] -> IntLiteral num) . readBin <$> (parseString "0b" *> some (parseCharsAsum "01") <* ps)
+        hex = fmap (IntLiteral . read) $ parseString "0x" >>= concatStringM (some hexDigit <* ps)
+        oct = fmap (IntLiteral . read) $ parseString "0o" >>= concatStringM (some octDigit <* ps)
+        hexDigit = parseCharF isDigit <|> parseCharsAsum "abcdefABCDEF"
         octDigit = parseCharsAsum "01234567"
 
 
 parseString :: String -> Parser String
-parseString token = markErrorP ("Expected " ++ token) $ sequenceA $ map charParser token
+parseString token = markErrorP ("Expected " ++ token) $ traverse charParser token
 
 parseCharF :: (Char -> Bool) -> Parser Char
-parseCharF p = Parser $ f
+parseCharF p = Parser f
   where
     f (x:xs)
       | p x = Right (x, xs)
       | otherwise = error $ "Unexpected '" ++ [x] ++ "'"
-    f _ = error $ "Unexpected end of input"
+    f _ = error "Unexpected end of input"
 
 charParser :: Char -> Parser Char
-charParser c = Parser $ f
+charParser c = Parser f
   where
     f (x:xs)
       | x == c = Right (c, xs)
@@ -290,7 +338,7 @@ error :: Error -> ParseResult a
 error msg = Left [(msg, "")]
 
 markErrorP :: String -> Parser a -> Parser a
-markErrorP msg (Parser p) = Parser $ markF
+markErrorP msg (Parser p) = Parser markF
   where mark  buff = "near: " ++ take 40 buff
         markF buff = case p buff of
           Left stack -> Left $ stack ++ [(msg, mark buff)]
@@ -306,20 +354,3 @@ markError :: String -> Either Error a -> Either Error a
 markError buffer (Left err) = Left $ err ++ "near: " ++ take 30 buffer
 markError _ (Right r) = Right r
 
-
-content :: String
-content = unsafePerformIO $ readFile "raylib-pp.h"
-
-parseFile :: IO ()
-parseFile = putStrLn $ unlines $ result
-  where result = case parseRec content of
-          Left errs -> map show errs
-          Right sts -> map show sts
-
-parseRec :: String -> Either ErrorStack [Statement]
-parseRec content = parsed
-  where parsed = (\(stmts, _) -> stmts) <$> parse (some parseStatement) content
-
-
-main :: IO ()
-main = putStrLn "Hello world"

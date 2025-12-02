@@ -12,24 +12,29 @@ import Data.Function (on)
 import System.IO.Unsafe (unsafePerformIO)
 import Numeric (readBin)
 
+data Empty = Empty
+type WarningStack = ErrorStack
+
+--                          stack trace  parsed remaining buffer  warnings
+type ParseResult a = Either ErrorStack   (a,    String,           WarningStack)
 newtype Parser a = Parser {
-  parse :: String -> Either ErrorStack (a, String)
+  parse :: String -> ParseResult a
 }
 
 instance Functor Parser where
   fmap f (Parser p) = Parser mapP
     where mapP buff = do
-            (a, rest) <- p buff
-            return (f a, rest)
+            (a, rest, warnings) <- p buff
+            return (f a, rest, warnings)
 
 instance Applicative Parser where
-  pure a = Parser (\buff -> Right (a, buff))
+  pure a = Parser (\buff -> Right (a, buff, []))
 
   (Parser pfab) <*> (Parser pa) = Parser f
     where f buffer = do
-            (fab, buff') <- pfab buffer
-            (a, buff'') <- pa buff'
-            return (fab a, buff'')
+            (fab, buff', warnings) <- pfab buffer
+            (a, buff'', warnings') <- pa buff'
+            return (fab a, buff'', warnings ++ warnings')
 
 instance Alternative Parser where
   empty = Parser f
@@ -43,9 +48,10 @@ instance Alternative Parser where
 instance Monad Parser where
   (Parser p1) >>= faMb = Parser f
     where f buff = do
-            (first, rest) <- p1 buff
-            case faMb first of
-              Parser p2 -> p2 rest
+            (first, rest, warnings) <- p1 buff
+            (next, rest', warnings') <- case faMb first of
+                                          Parser p2 -> p2 rest
+            return (next, rest', warnings ++ warnings')
 
 --scanM :: Monad m => (b -> a -> m b) -> b -> [m a] -> [m b]
 
@@ -66,8 +72,6 @@ data Type
   | Real32
   | Real64
   | Bool
-  | SChar
-  | UChar
   | Void
   | Ptr Type
   | FnType Fn
@@ -102,6 +106,9 @@ data Statement
                )
   | TypeDecl   TypedIdent
   | SkipDecl   String  -- as hints
+  | Preprocessor String
+  | Comment String
+  | EOF
 
   deriving (Show, Eq)
 
@@ -127,17 +134,21 @@ intSizeTokens = [("char",     Int8)
                ,("long",      Int64)
                ]
 
+addThd3 :: c -> (a, b) -> (a, b, c)
+addThd3 c (a,b) = (a,b,c)
+
 spanParser :: (Char -> Bool) -> Parser String
 spanParser f = Parser pf
-  where pf buff = Right $ span f buff
+  where pf buff = Right $ addThd3 [] $ span f buff
+
 
 ps :: Parser String
 ps = spanParser isSpace
 
-parseWS :: Parser String
-parseWS = spanParser isWS
-  where isWS c
-          | c /= '\n' && c /= '\r' = isSpace c
+parseUntilEol :: Parser String
+parseUntilEol = spanParser isEolC
+  where isEolC c
+          | c /= '\n' && c /= '\r' = True
           | otherwise              = False
 
 parseAnyC :: String -> Parser String
@@ -218,12 +229,22 @@ parseTypedIdentM = do
 
 parseStatement :: Parser Statement
 parseStatement = markErrorP "Error parsing statement" $ statements <* ps
-  where statements = parseTypeDecl <|> parseStructDecl <|> parseEnumDecl <|> parseFnPtrDecl <|> parseFnDecl
+  where statements =
+          parseEOF
+          <|> parseComment
+          <|> parsePP
+          <|> parseTypeDecl
+          <|> parseStructDecl
+          <|> parseEmptyStructDecl
+          <|> parseEnumDecl
+          <|> parseFnPtrDecl
+          <|> parseFnDecl
+
         semic = charParser ';'
 
         parseTypeDecl = do
           _ <- parseString "typedef" <* ps
-          _ <- optional $ (parseString "struct" <|> parseString "struct") <* ps
+          --_ <- optional $ (parseString "struct" <|> parseString "struct") <* ps
           (TypeDecl <$> parseTypedIdentM) <* semic <* ps
 
         parseStructDecl = do
@@ -240,6 +261,14 @@ parseStatement = markErrorP "Error parsing statement" $ statements <* ps
                   TypedIdent (t, name) <- parseTypedIdentM
                   names <- many $ charParser ',' *> ps *> parseIdentM <* ps
                   return $ map (\n -> TypedIdent (t, n)) (name : names)
+
+        parseEmptyStructDecl = do
+          _ <- parseString "typedef" <* ps
+          _ <- parseString "struct" <* ps
+          _ <- parseIdentM <* ps
+          name <- parseIdentM <* ps
+          _ <- semic <* ps
+          return $ StructDecl (name, [])
 
         parseEnumDecl = do
           _ <- parseString "typedef" <* ps
@@ -295,8 +324,32 @@ parseStatement = markErrorP "Error parsing statement" $ statements <* ps
                then optional $ parseString "void" <* ps
                else optional ps
           _ <- charParser ')' <* ps
-          _ <- semic <* ps
+          _ <- ((Empty <$ semic) <|> skipBlock) <* ps
           return $ FunctionDecl $ Fn ( name, retType, args )
+
+        -- Preprocessor statements
+        -- These get skipped for now and generate a warning
+        parsePP = do
+          parsePPStatement <*
+            parserWarning "Preprocessor statements are ignored. Consider running the header file throug `cpp -P` first."
+
+
+parseEOF = Parser f
+  where f "" = pure (EOF, "", [])
+        f _  = error "" ""
+
+parseComment = parseBlockComment <|> parseLineComment
+  where
+    parseLineComment = do
+        _ <- parseString "//"
+        content <- parseUntilEol
+        _ <- parseString "\n\r" <|> parseString "\n" <|> ("" <$ parseEOF)
+        return $ Comment content
+    parseBlockComment = do
+        _ <- parseString "/*"
+        content <- parseUntil (parseString "*/")
+        _ <- parseString "*/"
+        return $ Comment content
 
 
 parseIntLit :: Parser IntLiteral
@@ -316,41 +369,102 @@ parseCharF :: (Char -> Bool) -> Parser Char
 parseCharF p = Parser f
   where
     f (x:xs)
-      | p x = Right (x, xs)
-      | otherwise = error $ "Unexpected '" ++ [x] ++ "'"
-    f _ = error "Unexpected end of input"
+      | p x = Right (x, xs, [])
+      | otherwise = error ("Unexpected '" ++ [x] ++ "'") (x:xs)
+    f buff = error "Unexpected end of input" buff
+
+
+parseAnyChar :: Parser Char
+parseAnyChar = Parser f
+  where
+    f (x:xs) = Right (x, xs, [])
+    f buff = error "Unexpected end of input" buff
 
 charParser :: Char -> Parser Char
-charParser c = Parser f
-  where
-    f (x:xs)
-      | x == c = Right (c, xs)
-      | otherwise = error $ "Expected " ++ [c] ++ " but got " ++ [x]
-    f _ = error $ "Expected '" ++ [c] ++ "' but reached end of input"
+charParser c = do
+  x <- parseAnyChar
+  if x == c
+    then return x
+    else parserError $ "Expected " ++ [c] ++ " but got " ++ [x]
+
 
 parseCharsAsum :: String -> Parser Char
 parseCharsAsum chars = asum $ map charParser chars
 
+parseCNoSuffix :: Show a => Parser a -> Parser Char
+parseCNoSuffix parseSuffix = do
+  c <- parseAnyChar
+  suffix <- optional parseSuffix
+  case suffix of
+    Just s -> do
+      parserError $ "Unexpected '" ++ show s ++ "'"
+    Nothing -> return c
 
-type ParseResult a = Either ErrorStack (a, String)
+parseUntil :: Show a => Parser a -> Parser String
+parseUntil p = many (parseCNoSuffix p) >>= concatStringM (singleton <$> parseAnyChar)
 
-error :: Error -> ParseResult a
-error msg = Left [(msg, "")]
+parsePPStatement :: Parser Statement
+parsePPStatement = do
+  _ <- charParser '#'
+  Preprocessor <$> parseUntil parseEoPP
+
+  where parseEoPP = do
+          continue <- optional $ charParser '\\'
+          eol <- parseString "\n\r" <|> parseString "\n"
+          case continue of
+            Nothing -> return eol
+            Just _  -> parserError ""
+
+
+skipBlock :: Parser Empty
+skipBlock = do
+  _ <- charParser '{' <* ps
+  skipToEnd
+
+  where f :: Int -> String -> ParseResult Empty
+        f 0 rest       = Right (Empty, rest, [])
+        f n (x:xs)
+          | x == '{'   = skipCommentsContinue (n+1) xs
+          | x == '}'   = skipCommentsContinue (n-1) xs
+          | otherwise  = skipCommentsContinue n xs
+        f _ []         = error "Unexpected EOF" ""
+
+        skipCommentsContinue n buff =
+          case parse parseComment buff of
+            Right (_, buff', _) -> f n buff'
+            Left _ -> f n buff
+
+        skipToEnd = Parser $ f 1
+
+
+traceP :: String -> String
+traceP = take 40
+
+error :: Error -> String -> ParseResult a
+error msg buff = Left [(msg, traceP buff)]
+
+parserError :: String -> Parser a
+parserError msg = Parser f
+  where f = error msg
+
+parserWarning :: String -> Parser Empty
+parserWarning msg = Parser f
+  where f buff = Right (Empty, buff, [(msg, traceP buff)])
 
 markErrorP :: String -> Parser a -> Parser a
 markErrorP msg (Parser p) = Parser markF
-  where mark  buff = "near: " ++ take 40 buff
-        markF buff = case p buff of
-          Left stack -> Left $ stack ++ [(msg, mark buff)]
+  where markF buff = case p buff of
+          Left stack -> Left $ stack ++ [(msg, traceP buff)]
           good       -> good
+
+observing :: Parser a -> Parser (Either ErrorStack a)
+observing (Parser p) = Parser f
+  where f buffer = case p buffer of
+                     Right (result, rest, warnings) -> Right (Right result, rest, warnings)
+                     Left err -> Right (Left err, buffer, mempty)
 
 
 type ErrorWithMark = (String, String)
 type ErrorStack = [ErrorWithMark]
-
-  
 type Error = String
-markError :: String -> Either Error a -> Either Error a
-markError buffer (Left err) = Left $ err ++ "near: " ++ take 30 buffer
-markError _ (Right r) = Right r
 

@@ -1,70 +1,83 @@
 module Umka where
 
+import Debug.Trace
 import Data.Maybe
 import Data.Map qualified as M
 
 import C hiding (error)
 
---                               Generated  Warnings
-generateContent :: [Statement] -> ([String], [String])
-generateContent s = unzip . map (convertToUmka $ namedTypesMap s) $ filter filterStatement s
+generateContent
+  :: String -- fn prefix
+  -> Bool -- generate structs
+  -> Bool -- generate enums
+  -> Bool -- generate funcs
+  -> Bool -- keep unresolved
+  -> [Statement]
+  -> ([String], [String]) --Generated  Warnings
+generateContent fPrefix doStructs doEnums doFuncs keepUnresolved s = unzip . map (convertToUmka fPrefix keepUnresolved namedTypesMap') $ filteredStatements
+  where
+    filteredStatements = filter filterStatement s
+    namedTypesMap'      = namedTypesMap filteredStatements
+    filterStatement (FunctionDecl _) = doFuncs
+    filterStatement (StructDecl _)   = doStructs
+    filterStatement (EnumDecl _)     = doEnums
+    filterStatement (TypeDecl (TypedIdent (NamedType _, _))) = doStructs || doEnums
+    filterStatement _                = False
 
 namedTypesMap :: [Statement] -> M.Map String Type
-namedTypesMap stmts = M.fromList $ map prepare $ filter filterNamedT stmts
+namedTypesMap = foldl buildMap M.empty
   where prepare (TypeDecl (TypedIdent (t, n))) = (n, t)
         prepare (StructDecl (name, _)) = (name, NamedType name)
         prepare (EnumDecl (name, _))   = (name, NamedType name)
+        prepare _ = undefined
+        buildMap acc e = if filterNamedT acc e
+                         then uncurry M.insert (prepare e) acc
+                         else acc
 
-        filterNamedT (TypeDecl (TypedIdent (NamedType _, _))) = False
-        filterNamedT (TypeDecl (TypedIdent (_, _)))           = True
-        filterNamedT (StructDecl (name, _))                   = True
-        filterNamedT (EnumDecl (name, _))                     = True
-        filterNamedT _                                        = False
+        -- TODO: register type alias -> NamedType
+        filterNamedT m (TypeDecl (TypedIdent (NamedType tname, _))) = tname `M.member` m
+        filterNamedT _ (TypeDecl (TypedIdent (_, _)))               = True
+        filterNamedT _ (StructDecl (_, _))                          = True
+        filterNamedT _ (EnumDecl (_, _))                            = True
+        filterNamedT _ _                                            = False
 
-filterStatement :: Statement -> Bool
-filterStatement (FunctionDecl _) = True
-filterStatement (StructDecl _)   = True
-filterStatement (EnumDecl _)     = True
-filterStatement (TypeDecl (TypedIdent (NamedType _, _))) = True
-
-filterStatement _                = False
 
 endl = "\n"
 indent = "    "
 
-convertToUmka :: M.Map String Type -> Statement -> (String, String)
-convertToUmka m (FunctionDecl (Fn (name, retType, args))) =
-  if (not . null) fnPtrArgs
-  then ("", "Skipped function `" ++ name ++ "` because it has unsupported arguments.")
+convertToUmka :: String -> Bool -> M.Map String Type -> Statement -> (String, String)
+convertToUmka fPrefix keep m (FunctionDecl (Fn (name, retType, args))) =
+  if (not . null) unresolved && not keep
+  then ("", "Skipped function `" ++ name ++ "` because it has unsupported/unresolved arguments. Keep with `-keepunresolved`.")
   else (gen, "")
-  where fnPtrArgs = filter filterFnPtr args
-        filterFnPtr VarArg = True
-        filterFnPtr (TypeArg (TypedIdent (t, _))) =
+  where unresolved = filter filterUnresolved args
+        filterUnresolved VarArg = True
+        filterUnresolved (TypeArg (TypedIdent (t, _))) =
           case t of
             NamedType tn ->
               case M.lookup tn m of
-                Nothing         -> False
+                Nothing               -> True
                 Just (Ptr (FnType _)) -> True
-                Just _          -> False
+                Just _                -> False
             _ -> False
 
-        gen = "ffi fn "
+        gen = (if null fPrefix then "fn " else fPrefix ++ " fn ")
           ++ escapeKw name ++ "*("
           ++ join ", " (map convertFnArg args) ++ ")"
           ++ if retType /= Void then ": " ++ convertType retType ++ ";" else ";"
 
-convertToUmka _ (StructDecl (name, members)) = (gen, "")
+convertToUmka _ _ _ (StructDecl (name, members)) = (gen, "")
   where gen = "type " ++ escapeKw name ++ "* = struct {" ++ endl
           ++ concatMap (\(TypedIdent (t,n)) -> indent ++ escapeKw n ++ ": " ++ convertType t ++ endl) members
           ++ "}"
 
-convertToUmka _ (EnumDecl (name, members)) = (gen, "")
+convertToUmka _ _ _ (EnumDecl (name, members)) = (gen, "")
   where gen = "type " ++ escapeKw name ++ "* = enum {" ++ endl
           ++ concatMap (\(n,mi) -> indent ++ escapeKw n ++ maybe "" ((" = " ++) . show) mi ++ endl) members
           ++ "}"
 
-convertToUmka m (TypeDecl (TypedIdent (t, n))) =
-  if unresolvedT
+convertToUmka _ keep m (TypeDecl (TypedIdent (t, n))) =
+  if unresolvedT && not keep
   then ("", "Skippe typedef `" ++ n ++ "` because it is unresolved")
   else (gen, "")
   where gen = "type " ++ escapeKw n ++ "* = " ++ convertType t

@@ -124,6 +124,7 @@ typeTokens = [("int8_t",  IntType $ Signed Int8)
             ,("float",    Real32)
             ,("double",   Real64)
             ,("void",     Void)
+            ,("bool",     Bool)
             ]
 
             -- maybe unsigned
@@ -343,12 +344,12 @@ parseComment = parseBlockComment <|> parseLineComment
     parseLineComment = do
         _ <- parseString "//"
         content <- parseUntilEol
-        _ <- parseString "\n\r" <|> parseString "\n" <|> ("" <$ parseEOF)
+        _ <- (parseString "\n\r" <|> parseString "\n" <|> ("" <$ parseEOF)) <* ps
         return $ Comment content
     parseBlockComment = do
         _ <- parseString "/*"
         content <- parseUntil (parseString "*/")
-        _ <- parseString "*/"
+        _ <- parseString "*/" <* ps
         return $ Comment content
 
 

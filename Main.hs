@@ -24,7 +24,7 @@ parseFile filename args = do
       filterStatements (Right _) = True
       filterStatements (Left _)  = False
       generated = 
-        "// Generated using umka-cheaders (https://github.com/roastpiece/umka-cheaders)"
+        "// Generated using umka-cheaders (https://github.com/roastpiece/umka-cheaders)\n"
         ++ unlines (filter (not . null) umkaContent)
       
     in do
@@ -140,5 +140,5 @@ parseArgs argv = args
             ("nofuncs", _)          -> \a -> a { argNoFuncs = Just () }
             ("keepunresolved", _)   -> \a -> a { argKeepUnresolved = Just () }
             ("", filename)          -> \a -> a { argInput = Just filename }
-            (x, "")                 -> \a -> a { invalidArg = Just  x }
+            (x, _)                  -> \a -> a { invalidArg = Just  x }
 

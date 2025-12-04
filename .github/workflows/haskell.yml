@@ -18,7 +18,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    - uses: actions/setup-haskell@v1
+    - uses: actions/setup-haskell@82e8b5066385702e477d9dc98f287070493e8abd
       with:
         ghc-version: '9.10.1'
 

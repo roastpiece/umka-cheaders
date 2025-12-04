@@ -17,8 +17,8 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-haskell@82e8b5066385702e477d9dc98f287070493e8abd
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+    - uses: haskell-actions/setup@82e8b5066385702e477d9dc98f287070493e8abd # v2.8.2
       with:
         ghc-version: '9.10.1'
 
@@ -27,7 +27,7 @@ jobs:
         ghc Main.hs -O -o umka-cheaders
 
     - name: upload artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
       with:
         path: umka-cheaders*
     

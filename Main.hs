@@ -6,7 +6,7 @@ import System.Environment
 import System.Exit
 
 import C hiding (error)
-import Umka qualified
+import Umka
 
 parseFile :: String -> Arguments -> IO ()
 parseFile filename args = do
@@ -14,13 +14,14 @@ parseFile filename args = do
   let (_content, warnings) = result content
       statements = map (\(Right a) -> a) $ filter filterStatements _content
       errors = map (\(Left e) -> e) $ filter (not . filterStatements) _content
-      (umkaContent, umkaWarnings) = Umka.generateContent
-        (fromMaybe ""   $ argFnPrefix  args)
-        (fromMaybe True  $ False <$ argNoStructs      args)
-        (fromMaybe True  $ False <$ argNoEnums        args)
-        (fromMaybe True  $ False <$ argNoFuncs        args)
-        (fromMaybe False $ True  <$ argKeepUnresolved args)
+      (umkaContent, umkaWarnings) = generateContent
         statements
+        (argStructs  args)
+        (argEnums    args)
+        (argFuncs    args)
+        (argFnPrefix args)
+        (argExport   args)
+        (argKeepUnresolved args)
       filterStatements (Right _) = True
       filterStatements (Left _)  = False
       generated = 
@@ -114,31 +115,42 @@ help fail = do
 data Arguments = Arguments
   { argInput          :: Maybe String
   , argOutput         :: Maybe String
-  , argFnPrefix       :: Maybe String
-  , argNoStructs      :: Maybe ()
-  , argNoEnums        :: Maybe ()
-  , argNoFuncs        :: Maybe ()
-  , argKeepUnresolved :: Maybe ()
+  , argFnPrefix       :: FnPrefix
+  , argStructs        :: DoStructs
+  , argEnums          :: DoEnums
+  , argFuncs          :: DoFuncs
+  , argKeepUnresolved :: KeepUnresolved
+  , argExport         :: DoExport
   , invalidArg        :: Maybe String
   }
   deriving (Show)
 
-emptyArgs = Arguments Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing
+defaultArgs = Arguments
+  Nothing
+  Nothing
+  (FnPrefix "")
+  (DoStructs True)
+  (DoEnums True)
+  (DoFuncs True)
+  (KeepUnresolved False)
+  (DoExport True)
+  Nothing
   
 
 parseArgs :: [String] -> Arguments
 parseArgs argv = args
   where
-    args = foldl (\a f -> f a) emptyArgs argumentCtrs
+    args = foldl (\a f -> f a) defaultArgs argumentCtrs
     argumentCtrs = map parseArg argv
     parseArg arg =
           case splitArg arg of
             ("output", filename)    -> \a -> a { argOutput = Just filename }
-            ("fnprefix", prefix)    -> \a -> a { argFnPrefix = Just prefix }
-            ("nostructs", _)        -> \a -> a { argNoStructs = Just () }
-            ("noenums", _)          -> \a -> a { argNoEnums = Just () }
-            ("nofuncs", _)          -> \a -> a { argNoFuncs = Just () }
-            ("keepunresolved", _)   -> \a -> a { argKeepUnresolved = Just () }
+            ("fnprefix", prefix)    -> \a -> a { argFnPrefix = FnPrefix prefix }
+            ("nostructs", _)        -> \a -> a { argStructs = DoStructs False }
+            ("noenums", _)          -> \a -> a { argEnums = DoEnums False }
+            ("nofuncs", _)          -> \a -> a { argFuncs = DoFuncs False }
+            ("noexport ", _)        -> \a -> a { argExport = DoExport False }
+            ("keepunresolved", _)   -> \a -> a { argKeepUnresolved = KeepUnresolved True }
             ("", filename)          -> \a -> a { argInput = Just filename }
             (x, _)                  -> \a -> a { invalidArg = Just  x }
 
